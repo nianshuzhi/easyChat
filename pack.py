@@ -1,12 +1,23 @@
-import os
+import subprocess
+import sys
 
 
 # 用来自动打包成exe程序
 def main():
-    cmd = f"pyinstaller.exe -Fw --noupx wechat_gui.py"
+    cmd = [
+        sys.executable,
+        "-m",
+        "PyInstaller",
+        "-F",
+        "-w",
+        "--noupx",
+        "--clean",
+        "--name",
+        "EasyChat",
+        "wechat_gui.py",
+    ]
 
-    # 执行命令并打印输出
-    result = os.system(cmd)
+    subprocess.run(cmd, check=True)
 
 
 if __name__ == '__main__':

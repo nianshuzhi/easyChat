@@ -13,6 +13,8 @@ from PyQt5.QtGui import *
 class ClockThread(QThread):
     # 定义信号：用于通知GUI显示错误信息
     error_signal = pyqtSignal(str)
+    # 定义信号：用于通知GUI线程执行发送（避免在子线程里直接操作Qt控件）
+    send_signal = pyqtSignal(int, int, str)
 
     def __init__(self):
         super().__init__()
@@ -34,8 +36,39 @@ class ClockThread(QThread):
         # 用于防止掉线的内部计时器
         self._prevent_timer = 0
 
+        # 由GUI线程维护并推送进来的“定时列表快照”（避免子线程直接访问Qt控件）
+        self._schedules_lock = threading.Lock()
+        self._schedules = []
+
+        # 用于唤醒等待（定时列表变更/停止定时/防掉线更早触发）
+        self._wakeup_event = threading.Event()
+
+        # 允许“迟到执行”的宽限时间（秒）：避免因为线程调度/系统短暂卡顿错过窗口
+        self.late_grace_seconds = 10 * 60
+
     def __del__(self):
         self.wait()
+
+    def reset_state(self):
+        """开始定时前重置状态，避免重复/过期标记影响下一次开始。"""
+        self.executed_tasks.clear()
+        self._prevent_timer = self.prevent_count * 60
+        self._wakeup_event.set()
+
+    def stop(self):
+        """停止定时，并立即唤醒线程以便快速退出。"""
+        self.time_counting = False
+        self._wakeup_event.set()
+
+    def set_schedules(self, schedules):
+        """由GUI线程调用：推送最新的定时列表（字符串列表）。"""
+        with self._schedules_lock:
+            self._schedules = list(schedules or [])
+        self._wakeup_event.set()
+
+    def _get_schedules_snapshot(self):
+        with self._schedules_lock:
+            return list(self._schedules)
 
     def run(self):
         import uiautomation as auto
@@ -44,103 +77,84 @@ class ClockThread(QThread):
             self._prevent_timer = self.prevent_count * 60
 
             while self.time_counting:
+                schedules = self._get_schedules_snapshot()
                 now = datetime.datetime.now()
+
+                # --- 1) 解析任务、执行到期任务、寻找下一次触发 ---
                 next_event_time = None
 
-                # --- 1. 遍历列表，查找最近的下一个闹钟时间 ---
-                try:
-                    for i in range(self.clocks.count()):
-                        task_id = self.clocks.item(i).text()
-                        # 如果任务已经执行过，则跳过
-                        if task_id in self.executed_tasks:
-                            continue
+                for task_id in schedules:
+                    if not task_id or task_id in self.executed_tasks:
+                        continue
 
+                    try:
                         parts = task_id.split(" ")
+                        if len(parts) < 6:
+                            raise ValueError("任务格式错误，应为 'Y m d H M st-ed'")
+
                         clock_str = " ".join(parts[:5])
                         dt_obj = datetime.datetime.strptime(clock_str, "%Y %m %d %H %M")
 
-                        # 只关心未来的任务
-                        if dt_obj > now:
-                            # 如果是第一个找到的未来任务，或者比已知的下一个任务更早
-                            if next_event_time is None or dt_obj < next_event_time:
-                                next_event_time = dt_obj
-                except Exception as e:
-                    # 在UI更新列表时，直接读取可能会有瞬时错误，做个保护
-                    error_msg = f"读取闹钟列表时出错: {e}"
-                    print(error_msg)
-                    # 停止定时任务
-                    self.time_counting = False
-                    # 发送信号通知GUI显示错误
-                    self.error_signal.emit(error_msg)
-                    return
-
-                # --- 2. 计算休眠时间 ---
-                sleep_seconds = 0  # 默认休眠0秒，如果没有找到任何未来任务
-
-                if next_event_time:
-                    delta = (next_event_time - now).total_seconds()
-                    # 确保休眠时间不为负
-                    sleep_seconds = max(0, delta)
-
-                print(sleep_seconds)
-
-                # --- 3. 整合“防止掉线”的逻辑 ---
-                if self.prevent_offline:
-                    # 取“下一个闹钟”和“下一次防掉线”中更早发生的一个
-                    sleep_seconds = min(sleep_seconds, self._prevent_timer)
-
-                # --- 4. 执行休眠 ---
-                # sleep_seconds 可能是小数，time.sleep支持
-                time.sleep(sleep_seconds)
-
-                # 更新防止掉线的内部计时器
-                self._prevent_timer -= sleep_seconds
-                if self._prevent_timer <= 0:
-                    self._prevent_timer = 0  # 避免变为很大的负数
-
-                # --- 5. 休眠结束，检查并执行到期的任务 ---
-                now = datetime.datetime.now()  # 获取唤醒后的精确时间
-
-                # 检查并执行到期的闹钟
-                try:
-                    for i in range(self.clocks.count()):
-                        task_id = self.clocks.item(i).text()
-                        print(task_id)
-                        if task_id in self.executed_tasks:
-                            continue
-
-                        parts = task_id.split(" ")
                         st_ed = parts[5]
-                        st, ed = st_ed.split('-')
-                        clock_str = " ".join(parts[:5])
-                        dt_obj = datetime.datetime.strptime(clock_str, "%Y %m %d %H %M")
+                        st, ed = st_ed.split('-', 1)
+                        st_i, ed_i = int(st), int(ed)
 
-                        # 只执行刚刚到期的任务（时间窗口：60秒内）
-                        time_diff = (now - dt_obj).total_seconds()
-                        if 0 <= time_diff <= 60:
-                            if self.send_func:
-                                self.send_func(st=int(st), ed=int(ed))
-                            # 记录为已执行
+                        if dt_obj <= now:
+                            late_seconds = (now - dt_obj).total_seconds()
+                            if 0 <= late_seconds <= self.late_grace_seconds:
+                                # 通过信号让GUI线程去执行发送，避免子线程直接访问Qt控件
+                                self.send_signal.emit(st_i, ed_i, task_id)
+                            # 无论是否执行，都标记为已处理，防止重复触发
                             self.executed_tasks.add(task_id)
-                        elif time_diff > 60:
-                            # 超过60秒的任务标记为已过期，不再执行
-                            self.executed_tasks.add(task_id)
+                            continue
 
-                except Exception as e:
-                    error_msg = f"执行任务时读取闹钟列表出错: {e}"
-                    print(error_msg)
-                    # 停止定时任务
-                    self.time_counting = False
-                    # 发送信号通知GUI显示错误
-                    self.error_signal.emit(error_msg)
-                    return
+                        # 未来任务：找最近的一次
+                        if next_event_time is None or dt_obj < next_event_time:
+                            next_event_time = dt_obj
 
-                # 检查并执行防止掉线
-                if self.prevent_offline and self._prevent_timer <= 0:
-                    if self.prevent_func:
-                        self.prevent_func()
-                    # 重置计时器
-                    self._prevent_timer = self.prevent_count * 60
+                    except Exception as e:
+                        # 单条任务解析失败：跳过并提示，但不要直接终止整个定时线程
+                        error_msg = f"定时任务格式解析失败，将跳过：{task_id}\n错误信息：{e}"
+                        print(error_msg)
+                        self.error_signal.emit(error_msg)
+                        self.executed_tasks.add(task_id)
+
+                # --- 2) 计算等待时间（支持列表变更/停止时立刻唤醒） ---
+                wait_seconds = None
+                if next_event_time is not None:
+                    wait_seconds = max(0.0, (next_event_time - now).total_seconds())
+
+                # 防止掉线：取更早发生的那个
+                if self.prevent_offline:
+                    if wait_seconds is None:
+                        wait_seconds = float(self._prevent_timer)
+                    else:
+                        wait_seconds = min(float(wait_seconds), float(self._prevent_timer))
+
+                # 没有未来任务也没开启防掉线：避免忙等，稍微休眠并等待列表变更
+                if wait_seconds is None:
+                    wait_seconds = 1.0
+
+                start_mono = time.monotonic()
+                self._wakeup_event.wait(timeout=wait_seconds)
+                self._wakeup_event.clear()
+                elapsed = time.monotonic() - start_mono
+
+                # 如果此时已经停止定时，直接退出，避免停止后仍执行防掉线等动作
+                if not self.time_counting:
+                    break
+
+                # --- 3) 更新防掉线计时器并执行防掉线 ---
+                if self.prevent_offline:
+                    self._prevent_timer -= elapsed
+                    if self._prevent_timer <= 0:
+                        self._prevent_timer = 0
+                        if self.prevent_func:
+                            try:
+                                self.prevent_func()
+                            finally:
+                                # 重置计时器
+                                self._prevent_timer = self.prevent_count * 60
 
 
 class MyListWidget(QListWidget):

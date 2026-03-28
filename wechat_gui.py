@@ -48,6 +48,10 @@ class WechatGUI(QWidget):
         self.clock = ClockThread()
         # 连接定时任务错误信号到弹窗函数
         self.clock.error_signal.connect(self.show_clock_error)
+        # 连接“到点发送”信号到GUI线程执行（避免子线程直接操作Qt控件）
+        self.clock.send_signal.connect(self.on_clock_send)
+        # 定时线程触发的发送函数（由 init_send_msg 注入）
+        self._clock_send_func = None
 
         # 发消息的用户列表
         self.contacts = []
@@ -95,6 +99,19 @@ class WechatGUI(QWidget):
         self.clock_info.setText("定时发送（目前未开始）")
         # 弹出错误提示
         QMessageBox.critical(self, "定时任务执行错误", error_msg)
+
+    @pyqtSlot(int, int, str)
+    def on_clock_send(self, st: int, ed: int, task_id: str):
+        """
+        定时线程到点后会发信号到这里，确保发送逻辑在GUI线程里执行。
+        """
+        if self._clock_send_func is None:
+            self.show_clock_error(f"定时任务触发但发送函数未初始化：{task_id}")
+            return
+        try:
+            self._clock_send_func(st=st, ed=ed)
+        except Exception as e:
+            self.show_clock_error(f"执行定时任务失败：{task_id}\n错误信息：{e}")
 
     # 选择用户界面的初始化
     def init_choose_contacts(self):
@@ -226,6 +243,8 @@ class WechatGUI(QWidget):
 
             self.config["schedules"] = schedules
             self.save_config()
+            # 推送最新列表到定时线程（避免子线程直接读Qt控件 + 长时间sleep错过新任务）
+            self.clock.set_schedules(schedules)
             
         # 按钮响应：增加时间
         def add_contact():
@@ -285,14 +304,23 @@ class WechatGUI(QWidget):
                 return
             else:
                 self.clock.time_counting = True
+                # 每次开始定时都重置状态，避免上一次的 executed_tasks 影响本次
+                self.clock.reset_state()
+                # 启动前先推送一次当前列表
+                schedules = []
+                for i in range(self.time_view.count()):
+                    schedules.append(self.time_view.item(i).text())
+                self.clock.set_schedules(schedules)
 
             self.clock_info.setStyleSheet("color:red")
             self.clock_info.setText("定时发送（目前已开始）")
-            self.clock.start()
+            # 如果线程仍在运行（例如刚停止又立刻开始），不需要重复start，只要唤醒即可
+            if not self.clock.isRunning():
+                self.clock.start()
 
         # 按钮响应：结束定时
         def end_counting():
-            self.clock.time_counting = False
+            self.clock.stop()
             self.clock_info.setStyleSheet("color:black")
             self.clock_info.setText("定时发送（目前未开始）")
 
@@ -316,11 +344,15 @@ class WechatGUI(QWidget):
 
         # 左边的时间列表
         self.time_view = MyListWidget()
+        # 编辑/修改列表项后也要同步配置并推送到定时线程
+        self.time_view.itemChanged.connect(lambda *_: update_schedules())
         # 加载配置文件里保存的用户
         for schedule in self.config["schedules"]:
             self.time_view.addItem(schedule)
             
         self.clock.clocks = self.time_view
+        # 初始化时推送一次列表快照
+        self.clock.set_schedules(self.config["schedules"])
         hbox.addWidget(self.time_view)
 
         # 右边的按钮界面
@@ -482,6 +514,7 @@ class WechatGUI(QWidget):
             self.msg.addItem(message)
 
         self.clock.send_func = send_msg
+        self._clock_send_func = send_msg
         self.clock.prevent_func = self.wechat.prevent_offline
 
         # 发送按钮
