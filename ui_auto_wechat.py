@@ -89,15 +89,64 @@ class WeChat:
 
     # 打开微信客户端
     def open_wechat(self):
-        # 先检查微信窗口是否已经可见
-        if self.is_wechat_visible():
-            # 如果已经可见，只需要激活窗口到前台
-            wechat_window = self.get_wechat()
-            wechat_window.SetFocus()
+        """
+        打开/唤起微信窗口，使其处于可交互状态（非最小化、在前台）。
+
+        说明：
+        - 仅依赖 Ctrl+Alt+w 的“显示/隐藏切换”在“最小化所有窗口/显示桌面”等场景下不够稳定
+        - 这里优先用 WinAPI 进行 Restore + 前置，必要时再按快捷键，并等待窗口出现
+        """
+
+        def _restore_and_focus(window_ctrl) -> bool:
+            try:
+                if not window_ctrl.Exists(0, 0):
+                    return False
+                hwnd = window_ctrl.NativeWindowHandle
+                user32 = windll.user32
+                # 9 = SW_RESTORE：从最小化/最大化还原
+                user32.ShowWindow(hwnd, 9)
+                user32.SetForegroundWindow(hwnd)
+                window_ctrl.SetFocus()
+                return True
+            except Exception:
+                try:
+                    window_ctrl.SetFocus()
+                    return True
+                except Exception:
+                    return False
+
+        # 1) 如果窗口存在：无论是否最小化，都尝试直接还原并聚焦
+        window = auto.WindowControl(Depth=1, Name=self.lc.weixin, searchDepth=1)
+        if _restore_and_focus(window):
             return
 
-        # 如果窗口不可见，通过按下微信打开窗口的全局快捷键来打开微信窗口
-        auto.SendKeys("{Ctrl}{Alt}w")
+        # 2) 尝试按快捷键显示窗口（微信新版推荐方式）
+        try:
+            auto.SendKeys("{Ctrl}{Alt}w")
+        except Exception:
+            pass
+
+        # 3) 等待窗口出现并还原
+        for _ in range(40):  # 最多约 4 秒
+            window = auto.WindowControl(Depth=1, Name=self.lc.weixin, searchDepth=1)
+            if _restore_and_focus(window):
+                return
+            time.sleep(0.1)
+
+        # 4) 仍未出现：尝试直接启动微信进程（需要配置正确的 self.path）
+        try:
+            if self.path and os.path.exists(self.path):
+                subprocess.Popen(self.path)
+        except Exception:
+            pass
+
+        for _ in range(80):  # 最多约 8 秒
+            window = auto.WindowControl(Depth=1, Name=self.lc.weixin, searchDepth=1)
+            if _restore_and_focus(window):
+                return
+            time.sleep(0.1)
+
+        raise RuntimeError("无法唤起微信窗口：请确认微信已登录、快捷键为 Ctrl+Alt+w，且未处于锁屏/安全桌面状态")
     
     # 搜寻微信客户端控件
     def get_wechat(self):

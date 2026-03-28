@@ -46,6 +46,10 @@ class ClockThread(QThread):
         # 允许“迟到执行”的宽限时间（秒）：避免因为线程调度/系统短暂卡顿错过窗口
         self.late_grace_seconds = 10 * 60
 
+        # 等待分片：避免长时间等待遇到系统睡眠后“醒来仍继续等很久”，导致错过定时
+        # 取值越小，越能在唤醒后快速恢复；同时CPU开销会略增（但5秒基本可忽略）
+        self.max_wait_slice_seconds = 5.0
+
     def __del__(self):
         self.wait()
 
@@ -134,6 +138,9 @@ class ClockThread(QThread):
                 # 没有未来任务也没开启防掉线：避免忙等，稍微休眠并等待列表变更
                 if wait_seconds is None:
                     wait_seconds = 1.0
+                else:
+                    # 将长等待切片：即使系统睡眠很久，唤醒后也会在一个切片周期内重新计算
+                    wait_seconds = min(float(wait_seconds), float(self.max_wait_slice_seconds))
 
                 start_mono = time.monotonic()
                 self._wakeup_event.wait(timeout=wait_seconds)

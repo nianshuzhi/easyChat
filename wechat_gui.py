@@ -3,6 +3,7 @@ import time
 import os
 import itertools
 import json
+import logging
 
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
@@ -59,6 +60,23 @@ class WechatGUI(QWidget):
         # 初始化图形界面
         self.initUI()
 
+        # 简单日志：用于排查“定时是否触发/为什么失败”
+        self._logger = logging.getLogger("easychat")
+        if not self._logger.handlers:
+            self._logger.setLevel(logging.INFO)
+            try:
+                if getattr(sys, "frozen", False):
+                    base_dir = os.path.dirname(sys.executable)
+                else:
+                    base_dir = os.path.dirname(os.path.abspath(__file__))
+                log_path = os.path.join(base_dir, "easychat_clock.log")
+                fh = logging.FileHandler(log_path, encoding="utf-8")
+                fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+                self._logger.addHandler(fh)
+            except Exception:
+                # 不影响主流程
+                pass
+
         # 判断全局热键是否被按下
         self.hotkey_pressed = False
         keyboard.add_hotkey('ctrl+alt+q', self.hotkey_press)
@@ -106,11 +124,19 @@ class WechatGUI(QWidget):
         定时线程到点后会发信号到这里，确保发送逻辑在GUI线程里执行。
         """
         if self._clock_send_func is None:
+            if hasattr(self, "_logger"):
+                self._logger.error("clock_trigger_no_send_func task_id=%s", task_id)
             self.show_clock_error(f"定时任务触发但发送函数未初始化：{task_id}")
             return
         try:
+            if hasattr(self, "_logger"):
+                self._logger.info("clock_trigger_start task_id=%s st=%s ed=%s", task_id, st, ed)
             self._clock_send_func(st=st, ed=ed)
+            if hasattr(self, "_logger"):
+                self._logger.info("clock_trigger_done task_id=%s", task_id)
         except Exception as e:
+            if hasattr(self, "_logger"):
+                self._logger.exception("clock_trigger_error task_id=%s", task_id)
             self.show_clock_error(f"执行定时任务失败：{task_id}\n错误信息：{e}")
 
     # 选择用户界面的初始化
