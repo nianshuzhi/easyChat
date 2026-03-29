@@ -131,6 +131,7 @@ class WechatGUI(QWidget):
         try:
             if hasattr(self, "_logger"):
                 self._logger.info("clock_trigger_start task_id=%s st=%s ed=%s", task_id, st, ed)
+            self._in_clock_send = True
             self._clock_send_func(st=st, ed=ed)
             if hasattr(self, "_logger"):
                 self._logger.info("clock_trigger_done task_id=%s", task_id)
@@ -138,6 +139,8 @@ class WechatGUI(QWidget):
             if hasattr(self, "_logger"):
                 self._logger.exception("clock_trigger_error task_id=%s", task_id)
             self.show_clock_error(f"执行定时任务失败：{task_id}\n错误信息：{e}")
+        finally:
+            self._in_clock_send = False
 
     # 选择用户界面的初始化
     def init_choose_contacts(self):
@@ -514,7 +517,9 @@ class WechatGUI(QWidget):
                                 # 分出at的人和发送的文本内容
                                 at_names, text = content.split(":", 1)
                                 at_names = at_names.split(",")
-                                self.wechat.send_msg(name, at_names, text, search_user)
+                                ok = self.wechat.send_msg(name, at_names, text, search_user)
+                                if ok is False:
+                                    raise RuntimeError(f"微信返回发送失败（联系人：{name}）")
 
                             # 判断为文件内容
                             elif type == "file":
@@ -524,7 +529,13 @@ class WechatGUI(QWidget):
                             search_user = False
 
             except Exception as e:
+                if hasattr(self, "_logger"):
+                    self._logger.exception("send_msg_error st=%s ed=%s", st, ed)
                 QMessageBox.warning(self, "发送失败", f"发送失败！请检查内容格式或是否有遗漏步骤！\n错误信息：{e}")
+                # 手动发送：保持原行为（只提示，不抛异常）
+                # 定时发送：抛出异常，让 on_clock_send 记录 clock_trigger_error 并弹更明确的错误
+                if getattr(self, "_in_clock_send", False):
+                    raise
                 return
 
         # 左边的布局

@@ -68,12 +68,64 @@ class WeChat:
         # 搜索联系人后等待对话框弹出的时间（秒），可由GUI动态修改
         self.search_wait = 0.3
         
+    def _find_wechat_window(self):
+        """
+        更鲁棒地定位微信主窗口。
+
+        不能只依赖窗口标题 Name='微信'：
+        - 定时触发时窗口标题可能变化（未读数/当前会话名等）
+        - 不同版本/语言/状态下 Depth/searchDepth 也会波动
+        """
+        # 1) 经典主窗口类名（多数版本适用）
+        try:
+            w = auto.WindowControl(ClassName="WeChatMainWndForPC", searchDepth=2)
+            if w.Exists(0, 0):
+                return w
+        except Exception:
+            pass
+
+        # 2) 兜底：按标题模糊匹配（包含“微信/Weixin”）
+        for kwargs in (
+            {"Name": self.lc.weixin, "searchDepth": 2},
+            {"SubName": self.lc.weixin, "searchDepth": 2},
+            # 英文环境下 lc.weixin 可能是 Weixin，但窗口标题仍可能是“微信”
+            {"SubName": "微信", "searchDepth": 2},
+            {"SubName": "Weixin", "searchDepth": 2},
+        ):
+            try:
+                w = auto.WindowControl(**kwargs)
+                if w.Exists(0, 0):
+                    return w
+            except Exception:
+                continue
+
+        # 3) 最后兜底：扫描顶层窗口（避免 WindowControl 条件过严导致找不到）
+        try:
+            root = auto.GetRootControl()
+            for child in root.GetChildren():
+                try:
+                    if child.ControlTypeName != "WindowControl":
+                        continue
+                    # 命中 className 或标题包含关键字即可
+                    if child.ClassName == "WeChatMainWndForPC":
+                        return child
+                    n = (child.Name or "")
+                    if ("微信" in n) or ("Weixin" in n):
+                        # 有些窗口可能是弹窗，优先挑选看起来像主窗口的
+                        return child
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return None
+
     # 检查微信窗口是否可见
     def is_wechat_visible(self):
         try:
-            wechat_window = auto.WindowControl(Depth=1, Name=self.lc.weixin, searchDepth=1)
+            wechat_window = self._find_wechat_window()
             # 检查窗口是否存在且可见（非最小化）
-            if wechat_window.Exists(0, 0):
+            if wechat_window and wechat_window.Exists(0, 0):
                 # 获取窗口句柄
                 hwnd = wechat_window.NativeWindowHandle
                 # 使用 Windows API 检查窗口是否可见且未最小化
@@ -116,7 +168,7 @@ class WeChat:
                     return False
 
         # 1) 如果窗口存在：无论是否最小化，都尝试直接还原并聚焦
-        window = auto.WindowControl(Depth=1, Name=self.lc.weixin, searchDepth=1)
+        window = self._find_wechat_window()
         if _restore_and_focus(window):
             return
 
@@ -128,7 +180,7 @@ class WeChat:
 
         # 3) 等待窗口出现并还原
         for _ in range(40):  # 最多约 4 秒
-            window = auto.WindowControl(Depth=1, Name=self.lc.weixin, searchDepth=1)
+            window = self._find_wechat_window()
             if _restore_and_focus(window):
                 return
             time.sleep(0.1)
@@ -141,7 +193,7 @@ class WeChat:
             pass
 
         for _ in range(80):  # 最多约 8 秒
-            window = auto.WindowControl(Depth=1, Name=self.lc.weixin, searchDepth=1)
+            window = self._find_wechat_window()
             if _restore_and_focus(window):
                 return
             time.sleep(0.1)
@@ -150,7 +202,11 @@ class WeChat:
     
     # 搜寻微信客户端控件
     def get_wechat(self):
-        return auto.WindowControl(Depth=1, Name=self.lc.weixin)
+        w = self._find_wechat_window()
+        if w is None:
+            # 保持原行为：让上层报错更清晰
+            raise RuntimeError("未找到微信主窗口")
+        return w
 
     # 获取当前聊天对象的昵称
     def get_current_name(self):
