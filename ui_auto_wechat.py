@@ -177,13 +177,42 @@ class WeChat:
     # 搜索指定用户
     def get_contact(self, name):
         self.open_wechat()
-        self.get_wechat()
-        
-        # 搜索框在不同的界面上深度不同（例如聊天界面和通讯录界面），因此统一先切换到聊天界面
-        chat_interface = auto.ButtonControl(Depth=6, Name=self.lc.weixin)
-        click(chat_interface)
-        
-        search_box = auto.EditControl(Depth=15, Name=self.lc.search)
+        root = self.get_wechat()
+        # 先确保微信窗口拿到焦点（避免控件树不稳定）
+        click(root)
+        time.sleep(0.2)
+
+        # 旧逻辑：通过某个固定 Depth 的“微信”按钮切换到聊天界面
+        # 新版本 UI 下该按钮可能不存在或深度变化，容易导致 Find Control Timeout
+        # 这里改为更稳的方式：尽量用快捷键聚焦搜索框 + 在窗口内按 Name 查找搜索框并重试
+        try:
+            auto.SendKeys("{Ctrl}f")
+            time.sleep(0.1)
+        except Exception:
+            pass
+
+        search_box = None
+        # 优先在 root 子树里找（更稳），找不到再全局找；并做短重试
+        for _ in range(30):  # 最多约 3 秒
+            try:
+                search_box = root.EditControl(Name=self.lc.search, searchDepth=20)
+                if search_box.Exists(0, 0):
+                    break
+            except Exception:
+                search_box = None
+
+            try:
+                search_box = auto.EditControl(Name=self.lc.search, searchDepth=20)
+                if search_box.Exists(0, 0):
+                    break
+            except Exception:
+                search_box = None
+
+            time.sleep(0.1)
+
+        if search_box is None or not search_box.Exists(0, 0):
+            raise RuntimeError("未找到微信搜索框，请确认微信已处于主界面且讲述人模式已开启")
+
         click(search_box)
         
         pyperclip.copy(name)
@@ -193,7 +222,27 @@ class WeChat:
         time.sleep(self.search_wait)
 
         # 现在群聊不会出现在搜索的第一行，需要手动选择
-        list_control = auto.ListControl(Depth=4)
+        list_control = None
+        for _ in range(30):  # 最多约 3 秒等待搜索结果列表出现
+            try:
+                list_control = root.ListControl(searchDepth=20)
+                if list_control.Exists(0, 0):
+                    break
+            except Exception:
+                list_control = None
+
+            try:
+                list_control = auto.ListControl(searchDepth=20)
+                if list_control.Exists(0, 0):
+                    break
+            except Exception:
+                list_control = None
+
+            time.sleep(0.1)
+
+        if list_control is None or not list_control.Exists(0, 0):
+            raise RuntimeError("未找到搜索结果列表（ListControl），可能是微信界面结构变化或当前不在可自动化状态")
+
         for item in list_control.GetChildren():
             # 联系人项的 ClassName 不包含 "XTableCell"，默认选择第一个联系人，点击进入窗口
             if "XTableCell" not in item.ClassName:
