@@ -281,7 +281,22 @@ class WeChat:
             search_user: 是否需要搜索群聊
         """
         if search_user:
-            self.get_contact(name)
+            last_err = None
+            for attempt in range(2):
+                try:
+                    self.get_contact(name)
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    # 定时触发时偶发控件树不稳定/焦点丢失，做一次轻量重试
+                    try:
+                        self.open_wechat()
+                    except Exception:
+                        pass
+                    time.sleep(0.6)
+            if last_err is not None:
+                raise last_err
         
         if at_names is not None:
             # @所有列表中的人名
@@ -320,7 +335,21 @@ class WeChat:
             search_user: 是否需要搜索用户
         """
         if search_user:
-            self.get_contact(name)
+            last_err = None
+            for attempt in range(2):
+                try:
+                    self.get_contact(name)
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    try:
+                        self.open_wechat()
+                    except Exception:
+                        pass
+                    time.sleep(0.6)
+            if last_err is not None:
+                raise last_err
         
         # 将文件复制到剪切板
         setClipboardFiles([path])
