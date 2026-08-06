@@ -155,10 +155,23 @@ class WeChat:
                     return False
                 hwnd = window_ctrl.NativeWindowHandle
                 user32 = windll.user32
-                # 9 = SW_RESTORE：从最小化/最大化还原
+                # 按指针宽度声明，避免 64 位 Windows 上 HWND 被当 32 位截断，
+                # 导致 ShowWindow/SetForegroundWindow 作用到错误句柄上、还原失败。
+                user32.ShowWindow.argtypes = [c_void_p, c_int]
+                user32.SetForegroundWindow.argtypes = [c_void_p]
+                user32.IsIconic.argtypes = [c_void_p]
+                user32.IsIconic.restype = c_int
+                user32.IsWindowVisible.argtypes = [c_void_p]
+                user32.IsWindowVisible.restype = c_int
+                # 9 = SW_RESTORE：从最小化/最大化还原并显示
                 user32.ShowWindow(hwnd, 9)
                 user32.SetForegroundWindow(hwnd)
                 window_ctrl.SetFocus()
+                # 核实是否真的还原了（不再最小化且可见）。
+                # 若仍最小化/不可见，说明 WinAPI 还原没生效（如最小化到托盘的隐藏窗口），
+                # 返回 False 让上层走 Ctrl+Alt+w 热键兜底——热键对最小化/隐藏最可靠。
+                if user32.IsIconic(hwnd) or not user32.IsWindowVisible(hwnd):
+                    return False
                 return True
             except Exception:
                 try:
