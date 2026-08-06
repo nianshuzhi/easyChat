@@ -48,6 +48,53 @@ def wheel_down():
     auto.WheelDown()
 
 
+def _force_foreground(hwnd) -> bool:
+    """
+    尽力将指定窗口置到前台，并核实是否真的成功。
+
+    Windows 存在前台锁定：从后台进程直接调用 SetForegroundWindow 会被拦截
+    （不报错，只闪任务栏图标）。这里用“关闭前台锁定超时 + 模拟 Alt 键”绕过，
+    最后用 GetForegroundWindow 核实当前前台确实为该窗口。
+    批量/定时发送时微信常被别的窗口遮挡，若不真正前置，按屏幕坐标点击会落空。
+    """
+    if not hwnd:
+        return False
+    user32 = windll.user32
+    # 显式按指针宽度声明，避免 64 位 Windows 上 HWND 被当 32 位截断，
+    # 导致 GetForegroundWindow() 与 hwnd 比较永远不相等而误判前置失败。
+    user32.GetForegroundWindow.restype = c_void_p
+    user32.SetForegroundWindow.argtypes = [c_void_p]
+    user32.ShowWindow.argtypes = [c_void_p, c_int]
+    # 关闭前台锁定超时（允许立即抢前台）
+    try:
+        SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
+        user32.SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, None, 0)
+    except Exception:
+        pass
+    # SW_RESTORE = 9：从最小化/最大化还原
+    try:
+        user32.ShowWindow(hwnd, 9)
+    except Exception:
+        pass
+    # 模拟一次 Alt 按下/释放，绕过前台锁定
+    try:
+        VK_MENU = 0x12
+        KEYEVENTF_KEYUP = 0x0002
+        user32.keybd_event(VK_MENU, 0, 0, 0)
+        user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+    except Exception:
+        pass
+    try:
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    try:
+        time.sleep(0.1)
+        return user32.GetForegroundWindow() == hwnd
+    except Exception:
+        return False
+
+
 class WeChat:
     def __init__(self, path, locale="zh-CN"):
         # 微信打开路径
@@ -142,50 +189,54 @@ class WeChat:
     # 打开微信客户端
     def open_wechat(self):
         """
-        打开/唤起微信窗口，使其处于可交互状态（非最小化、在前台）。
+        打开/唤起微信窗口，使其处于前台可交互状态（非最小化、在前台）。
 
         说明：
-        - 仅依赖 Ctrl+Alt+w 的“显示/隐藏切换”在“最小化所有窗口/显示桌面”等场景下不够稳定
-        - 这里优先用 WinAPI 进行 Restore + 前置，必要时再按快捷键，并等待窗口出现
+        - 仅依赖 Ctrl+Alt+w 的“显示/隐藏切换”在“最小化所有窗口/显示桌面”等场景下不够稳定，
+          且它是 toggle：窗口“可见但被遮挡”时按一下反而会隐藏它。
+        - 这里优先用 WinAPI 强前置（Alt 技巧绕过前台锁定 + GetForegroundWindow 核实），
+          核实失败才回退到 Ctrl+Alt+w，避免误隐藏。
         """
-
-        def _restore_and_focus(window_ctrl) -> bool:
+        def _activate(window_ctrl) -> bool:
+            """强前置 + 核实成功后才返回 True，否则 False。"""
             try:
-                if not window_ctrl.Exists(0, 0):
+                if window_ctrl is None or not window_ctrl.Exists(0, 0):
                     return False
                 hwnd = window_ctrl.NativeWindowHandle
-                user32 = windll.user32
-                # 9 = SW_RESTORE：从最小化/最大化还原
-                user32.ShowWindow(hwnd, 9)
-                user32.SetForegroundWindow(hwnd)
-                window_ctrl.SetFocus()
+                if not _force_foreground(hwnd):
+                    return False
+                try:
+                    window_ctrl.SetFocus()
+                except Exception:
+                    pass
                 return True
             except Exception:
                 try:
                     window_ctrl.SetFocus()
-                    return True
+                    return _force_foreground(window_ctrl.NativeWindowHandle)
                 except Exception:
                     return False
 
-        # 1) 如果窗口存在：无论是否最小化，都尝试直接还原并聚焦
+        # 1) 窗口存在：做强前置 + 核实，带短重试（前台锁定偶发需重试）
         window = self._find_wechat_window()
-        if _restore_and_focus(window):
-            return
+        if window is not None and window.Exists(0, 0):
+            for _ in range(10):  # 最多约 2 秒
+                if _activate(window):
+                    return
+                time.sleep(0.2)
 
-        # 2) 尝试按快捷键显示窗口（微信新版推荐方式）
+        # 2) 窗口不存在或前置失败：尝试微信显示/隐藏快捷键，并等待窗口出现后强前置
         try:
             auto.SendKeys("{Ctrl}{Alt}w")
         except Exception:
             pass
-
-        # 3) 等待窗口出现并还原
         for _ in range(40):  # 最多约 4 秒
             window = self._find_wechat_window()
-            if _restore_and_focus(window):
+            if window is not None and window.Exists(0, 0) and _activate(window):
                 return
             time.sleep(0.1)
 
-        # 4) 仍未出现：尝试直接启动微信进程（需要配置正确的 self.path）
+        # 3) 仍未出现：尝试直接启动微信进程（需要配置正确的 self.path）
         try:
             if self.path and os.path.exists(self.path):
                 subprocess.Popen(self.path)
@@ -194,11 +245,11 @@ class WeChat:
 
         for _ in range(80):  # 最多约 8 秒
             window = self._find_wechat_window()
-            if _restore_and_focus(window):
+            if window is not None and window.Exists(0, 0) and _activate(window):
                 return
             time.sleep(0.1)
 
-        raise RuntimeError("无法唤起微信窗口：请确认微信已登录、快捷键为 Ctrl+Alt+w，且未处于锁屏/安全桌面状态")
+        raise RuntimeError("无法唤起微信窗口到前台：请确认微信已登录、快捷键为 Ctrl+Alt+w，且未处于锁屏/安全桌面状态")
     
     # 搜寻微信客户端控件
     def get_wechat(self):
@@ -312,9 +363,21 @@ class WeChat:
     
     # 鼠标移动到发送按钮处点击发送消息
     def press_enter(self):
-        # 获取发送按钮
+        # 定时/批量发送时微信窗口可能被遮挡或失去前台，此时按屏幕坐标点击会落空。
+        # open_wechat 会用 Alt 技巧绕过前台锁定并核实微信真的在前台，失败则抛错——
+        # 必须让它抛错，否则按钮即便被 Exists 找到，按屏幕坐标点击也会静默点空。
+        self.open_wechat()
+
+        # 查找发送按钮：带超时重试，避免界面未渲染好时静默匹配失败而点到 (0,0)。
         send_button = auto.ButtonControl(Depth=18, Name=self.lc.send)
+        if not send_button.Exists(2, 0.1):
+            # 退回按名称全局查找，兼容新版微信控件层级变化
+            send_button = auto.ButtonControl(Name=self.lc.send, searchDepth=20)
+            if not send_button.Exists(2, 0.1):
+                raise RuntimeError("未找到发送按钮，可能是微信界面变化或当前不在聊天界面")
         click(send_button)
+        # 等待发送动作落定，再进行后续校验或下一条发送
+        time.sleep(0.2)
 
     def paste_text(self, text: str) -> None:
         """
@@ -326,6 +389,8 @@ class WeChat:
         # 等待粘贴
         time.sleep(0.3)
         auto.SendKeys("{Ctrl}v")
+        # 等待粘贴内容落入输入框，避免立刻点击发送按钮时内容尚未渲染
+        time.sleep(0.3)
 
     def send_msg(self, name, at_names: List[str] = None, text: str = None, search_user: bool = True) -> bool:
         """
@@ -379,6 +444,10 @@ class WeChat:
             else:
                 return False
 
+        except NotImplementedError:
+            # 新版微信尚未适配 get_dialogs，无法精确校验发送结果，
+            # 此时发送按钮已被点击，按发送成功处理，避免批量发送被假阴性中断。
+            return True
         except Exception:
             return False
 
